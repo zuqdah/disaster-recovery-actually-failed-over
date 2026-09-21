@@ -97,23 +97,15 @@ resource "azurerm_mssql_failover_group" "orders" {
   }
 }
 
-# Both servers need the same firewall rules. A secondary that is unreachable
-# from where the application runs is not a standby, and this is only discovered
-# during the failover unless it is configured symmetrically from the start.
-resource "azurerm_mssql_firewall_rule" "azure_services_primary" {
-  name             = "allow-azure-services"
-  server_id        = azurerm_mssql_server.primary.id
-  start_ip_address = "0.0.0.0"
-  end_ip_address   = "0.0.0.0"
-}
-
-resource "azurerm_mssql_firewall_rule" "azure_services_secondary" {
-  name             = "allow-azure-services"
-  server_id        = azurerm_mssql_server.secondary.id
-  start_ip_address = "0.0.0.0"
-  end_ip_address   = "0.0.0.0"
-}
-
+# Both servers get the same rules, and only these. A secondary that is
+# unreachable from where the application runs is not a standby, and configuring
+# the two asymmetrically means discovering that during the failover.
+#
+# There is deliberately no "allow Azure services" rule. The 0.0.0.0 entry that
+# enables it is not scoped to this subscription or even this tenant -- it admits
+# any Azure resource anywhere -- and the drill runs on a GitHub-hosted runner,
+# which is not in Azure and is already covered by the rule below. It would have
+# been a permanent hole opened for a convenience nothing here needs.
 resource "azurerm_mssql_firewall_rule" "client_primary" {
   count            = var.client_ip == "" ? 0 : 1
   name             = "allow-drill-client"

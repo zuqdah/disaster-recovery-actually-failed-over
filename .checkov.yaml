@@ -10,6 +10,32 @@ skip-check:
   # CKV_GHA_7 wants workflow_dispatch inputs empty so build output cannot be
   # influenced by a caller. This workflow builds nothing; its input sets how
   # long the drill writes for, which changes how well supported the recovery
-  # point measurement is. Removing it would make the drill less rigorous, not
-  # more secure.
+  # point measurement is. Removing it would make the drill less rigorous.
   - CKV_GHA_7
+
+  # Public network access and private endpoints. The drill runs on a
+  # GitHub-hosted runner, which is outside Azure, so a private endpoint would
+  # need a virtual network and a self-hosted runner to reach it -- more moving
+  # parts than the thing being proven. Access is instead restricted to the
+  # single runner address for the life of the drill, and the "allow Azure
+  # services" rule that would have opened this to every Azure tenant was
+  # removed rather than suppressed.
+  - CKV_AZURE_113
+  - CKV2_AZURE_45
+
+  # Auditing, retention over 90 days, and vulnerability assessment all require
+  # a storage account to write to. This estate exists for about twenty minutes
+  # and is deleted along with anywhere those findings would have been kept, so
+  # the control would produce a bill and no reader.
+  - CKV_AZURE_23
+  - CKV_AZURE_24
+  - CKV2_AZURE_2
+
+  # Ledger gives cryptographic proof that data was not tampered with. Worth
+  # having where that matters; it is orthogonal to whether a failover works.
+  - CKV_AZURE_224
+
+  # Zone redundancy is not offered on the S0 tier, and it is the weaker of the
+  # two guarantees in play here: this lab demonstrates failover across two
+  # regions, which survives losing all zones in one of them.
+  - CKV_AZURE_229
