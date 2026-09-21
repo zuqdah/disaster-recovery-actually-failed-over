@@ -125,11 +125,27 @@ while ([datetime]::UtcNow -lt $deadline) {
 Write-Information "  $($acknowledged.Count) writes acknowledged before the failover was commanded."
 
 # ------------------------------------------------------------- failover phase
+# The ARM call rather than `az sql failover-group set-primary`, because that
+# command blocks until the failover finishes and has no --no-wait. Waiting for
+# it would mean nothing was writing during the switch, and the outage this
+# drill exists to measure would happen with nobody watching. The REST call
+# returns 202 Accepted straight away and the swap proceeds behind it.
+$subscriptionId = az account show --query id -o tsv
+if ([string]::IsNullOrWhiteSpace($subscriptionId)) { throw 'Could not determine the subscription.' }
+
+$failoverUrl = "https://management.azure.com/subscriptions/$subscriptionId" +
+    "/resourceGroups/$SecondaryResourceGroup/providers/Microsoft.Sql/servers/$SecondaryServer" +
+    "/failoverGroups/$FailoverGroup/failover?api-version=2021-11-01"
+
 $failoverStartedAt = [datetime]::UtcNow
 Write-Information "Commanding failover to $SecondaryServer."
-az sql failover-group set-primary --name $FailoverGroup --resource-group $SecondaryResourceGroup `
-    --server $SecondaryServer --no-wait 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'The failover command was rejected.' }
+$failoverResponse = az rest --method POST --url $failoverUrl 2>&1
+if ($LASTEXITCODE -ne 0) {
+    # The reason travels with the failure. An earlier version discarded this
+    # output, and the run reported only that the command had been rejected --
+    # which is the least useful true thing it could have said.
+    throw "The failover command was rejected: $failoverResponse"
+}
 
 # Keep writing. The first failure is the failure: it is the moment the
 # application stopped being able to serve, which is where the recovery time
@@ -228,10 +244,14 @@ $grade = Compare-ObjectiveToMeasurement -Objective $plan.objectives -Recovery $r
 # started, running unprotected in the region it fled to. Failing back is part
 # of the drill, not an afterthought.
 Write-Information "Failing back to $PrimaryServer."
+# Blocking here on purpose. Nothing is being timed on the way back, so the
+# simpler command is the right one -- but its output is kept, because a silent
+# failback failure leaves the estate in the region it fled to.
 $failbackStartedAt = [datetime]::UtcNow
-az sql failover-group set-primary --name $FailoverGroup --resource-group $PrimaryResourceGroup `
-    --server $PrimaryServer 2>&1 | Out-Null
+$failbackOutput = az sql failover-group set-primary --name $FailoverGroup `
+    --resource-group $PrimaryResourceGroup --server $PrimaryServer 2>&1
 $failbackOk = $LASTEXITCODE -eq 0
+if (-not $failbackOk) { Write-Information "  failback error: $failbackOutput" }
 
 $finalRole = Get-ReplicationRole -GroupName $FailoverGroup -ResourceGroup $PrimaryResourceGroup -Server $PrimaryServer
 $failbackSeconds = ([datetime]::UtcNow - $failbackStartedAt).TotalSeconds
