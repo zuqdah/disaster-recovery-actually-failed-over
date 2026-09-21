@@ -1,0 +1,77 @@
+name: Destroy
+
+on:
+  schedule:
+    # Nightly. The drill tears itself down even when it fails, so anything this
+    # finds is a cancelled or crashed run -- and two geo-replicated databases
+    # bill for every hour nobody noticed them.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type destroy to confirm.'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  destroy:
+    name: Remove anything this lab left behind
+    runs-on: ubuntu-latest
+    environment: lab
+    steps:
+      - name: Check the confirmation
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm != 'destroy' }}
+        run: |
+          echo "Confirmation was '${{ inputs.confirm }}', expected 'destroy'."
+          exit 1
+
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::${{ secrets.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ secrets.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # By resource group name, not from Terraform state. The drill keeps its
+      # state in the runner workspace and discards it at the end of the job, so
+      # a state-based destroy here would find nothing to do and report success
+      # over two live databases.
+      - name: Remove the lab resource groups
+        run: |
+          set -euo pipefail
+          groups=$(az group list --query "[?starts_with(name,'rg-drdrill-')].name" -o tsv)
+          if [ -z "$groups" ]; then
+            echo "Nothing left behind."
+            exit 0
+          fi
+          for g in $groups; do
+            echo "deleting $g"
+            az group delete --name "$g" --yes --no-wait
+          done
+
+      # A delete being accepted is not the same as it having happened, and a
+      # geo-replicated database left running is the expensive kind of leftover.
+      - name: Confirm they are gone
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            left=$(az group list --query "length([?starts_with(name,'rg-drdrill-')])" -o tsv)
+            if [ "$left" = "0" ]; then
+              echo "Confirmed empty on check $i."
+              exit 0
+            fi
+            echo "  $left group(s) still present (check $i)"
+            sleep 20
+          done
+          az group list --query "[?starts_with(name,'rg-drdrill-')].name" -o tsv >&2
+          echo "Resource groups from this lab are still present after ten minutes." >&2
+          exit 1

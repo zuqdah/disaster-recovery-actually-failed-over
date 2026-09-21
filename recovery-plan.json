@@ -1,0 +1,77 @@
+{
+  "$comment": "The plan states its objectives, the order things come back in, and the steps a stranger would follow. CI checks the plan is coherent; the drill checks reality agrees with it.",
+  "objectives": {
+    "RtoSeconds": 300,
+    "RpoSeconds": 5,
+    "rtoWhy": "Five minutes is the point at which an order-taking system stops looking slow and starts looking shut, and it is measured from the failure rather than from the decision to act. Detection and decision are inside it on purpose: they are most of a real outage, and they are the part a runbook can improve.",
+    "rpoWhy": "Auto-failover groups replicate asynchronously, so a forced failover can lose recently committed work. Five seconds is what Microsoft publishes for this configuration, and stating it honestly is better than claiming zero and discovering otherwise. A planned failover should lose nothing at all, and the drill checks both."
+  },
+  "services": [
+    {
+      "name": "database",
+      "dependsOn": [],
+      "note": "The failover group's listener endpoint. Nothing else can come back before this."
+    },
+    {
+      "name": "schema-check",
+      "dependsOn": ["database"],
+      "note": "Confirms the promoted replica carries the schema, not just a reachable server."
+    },
+    {
+      "name": "order-api",
+      "dependsOn": ["database", "schema-check"],
+      "note": "Reconnects through the listener. It holds no region-specific configuration, which is what makes the failover invisible to it."
+    },
+    {
+      "name": "order-intake",
+      "dependsOn": ["order-api"],
+      "note": "Resumes accepting writes. Last up deliberately: taking orders that cannot be stored is worse than refusing them."
+    }
+  ],
+  "runbook": [
+    {
+      "name": "Confirm the primary is genuinely unreachable",
+      "action": "Attempt a write through the listener endpoint and record the failure time.",
+      "expected": "Connection fails, and the failure is not a transient retry.",
+      "verify": "Invoke-Sqlcmd -ServerInstance $listener -Query 'SELECT 1' returns an error twice, thirty seconds apart"
+    },
+    {
+      "name": "Check the secondary is healthy before promoting it",
+      "action": "Read the replication state of the failover group.",
+      "expected": "The secondary reports a healthy replication link and a recent synchronisation.",
+      "verify": "az sql failover-group show --query replicationState"
+    },
+    {
+      "name": "Decide between planned and forced failover",
+      "action": "If the primary is reachable, fail over without data loss. If it is not, force it and accept the recovery point gap.",
+      "expected": "A recorded decision, with the time it was taken.",
+      "contact": "the incident lead",
+      "fallback": "If the incident lead cannot be reached within ten minutes, the on-call engineer may force the failover and record that they did so.",
+      "verify": "the drill report records decidedAt and whether the failover was forced"
+    },
+    {
+      "name": "Fail the group over",
+      "action": "az sql failover-group set-primary --name $fog --resource-group $secondaryRg --server $secondaryServer",
+      "expected": "The secondary server becomes the read-write primary and the listener follows it.",
+      "verify": "az sql failover-group show --query replicationRole reports Primary in the secondary region"
+    },
+    {
+      "name": "Confirm the application reconnects without being reconfigured",
+      "action": "Write through the same listener endpoint used before the failure, with no connection string change.",
+      "expected": "The write succeeds against the new primary.",
+      "verify": "a write through the listener succeeds and SELECT @@SERVERNAME returns the secondary server"
+    },
+    {
+      "name": "Account for what was lost",
+      "action": "Compare the sequence numbers the old primary acknowledged against those present on the new primary.",
+      "expected": "Either no acknowledged write is missing, or the gap is inside the stated recovery point objective.",
+      "verify": "the drill report's dataLoss verdict"
+    },
+    {
+      "name": "Fail back and confirm the original region is primary again",
+      "action": "az sql failover-group set-primary --name $fog --resource-group $primaryRg --server $primaryServer",
+      "expected": "The original region is primary again and the listener follows it back.",
+      "verify": "az sql failover-group show --query replicationRole reports Primary in the primary region"
+    }
+  ]
+}

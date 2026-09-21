@@ -1,0 +1,130 @@
+name: Drill
+
+# Manual only. This deploys paired databases and then deliberately fails one
+# region over; nothing about that should happen because a branch moved.
+on:
+  workflow_dispatch:
+    inputs:
+      write_seconds:
+        description: 'How long to write before commanding the failover. Longer means a better-supported recovery point result and a slightly longer run.'
+        type: string
+        default: '45'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+
+jobs:
+  drill:
+    name: Deploy, fail over, measure, fail back
+    runs-on: ubuntu-latest
+    environment: lab
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::${{ secrets.AZURE_TENANT_ID }}"
+          echo "::add-mask::${{ secrets.AZURE_CLIENT_ID }}"
+          echo "::add-mask::${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Federated credentials, so this workflow holds no secret that could leak
+      # or expire in the middle of a drill.
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Both servers get a firewall rule for this runner. A secondary that is
+      # unreachable from where the application runs is not a standby, and the
+      # failover is the worst possible time to find that out.
+      - name: Find the runner address
+        id: ip
+        run: echo "addr=$(curl -s https://api.ipify.org)" >> "$GITHUB_OUTPUT"
+
+      - name: Init
+        run: terraform -chdir=infra init -input=false
+
+      - name: Apply
+        env:
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_entra_admin_object_id: ${{ secrets.AZURE_CLIENT_OBJECT_ID }}
+          TF_VAR_entra_admin_login: ${{ vars.ENTRA_ADMIN_LOGIN }}
+          TF_VAR_client_ip: ${{ steps.ip.outputs.addr }}
+        run: terraform -chdir=infra apply -input=false -auto-approve
+
+      - name: Collect outputs
+        id: out
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra output -json > outputs.json
+          # jq -e so an output the apply never produced fails here rather than
+          # arriving as an empty string in the middle of the drill.
+          for k in listener_fqdn failover_group_name primary_server_name secondary_server_name \
+                   primary_resource_group secondary_resource_group database_name; do
+            v=$(jq -e -r ".${k}.value" outputs.json)
+            echo "${k}=${v}" >> "$GITHUB_OUTPUT"
+          done
+
+      # Geo-replication has to actually reach a synchronised state before a
+      # failover means anything. Failing over a replica that never caught up
+      # would measure the seeding, not the recovery.
+      - name: Wait for the replica to be seeded
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            state=$(az sql failover-group show \
+              --name "${{ steps.out.outputs.failover_group_name }}" \
+              --resource-group "${{ steps.out.outputs.primary_resource_group }}" \
+              --server "${{ steps.out.outputs.primary_server_name }}" \
+              --query "replicationState" -o tsv)
+            echo "  replication state: $state (check $i)"
+            [ "$state" = "CATCH_UP" ] && exit 0
+            sleep 10
+          done
+          echo "The replica never reached CATCH_UP; a failover now would measure seeding, not recovery." >&2
+          exit 1
+
+      - name: Run the drill
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module SqlServer -Force -Scope CurrentUser -AllowClobber
+          ./scripts/Invoke-FailoverDrill.ps1 `
+            -Listener '${{ steps.out.outputs.listener_fqdn }}' `
+            -Database '${{ steps.out.outputs.database_name }}' `
+            -FailoverGroup '${{ steps.out.outputs.failover_group_name }}' `
+            -PrimaryServer '${{ steps.out.outputs.primary_server_name }}' `
+            -SecondaryServer '${{ steps.out.outputs.secondary_server_name }}' `
+            -PrimaryResourceGroup '${{ steps.out.outputs.primary_resource_group }}' `
+            -SecondaryResourceGroup '${{ steps.out.outputs.secondary_resource_group }}' `
+            -WriteSeconds ${{ inputs.write_seconds }} `
+            -ReportPath 'drill-report.json'
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: drill-report
+          path: drill-report.json
+          if-no-files-found: warn
+
+      # Two geo-replicated databases bill for every hour they exist, so the
+      # teardown runs even when the drill failed. A lab that only cleans up on
+      # the happy path bills for its own bugs.
+      - name: Tear down
+        if: always()
+        env:
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_VAR_entra_admin_object_id: ${{ secrets.AZURE_CLIENT_OBJECT_ID }}
+          TF_VAR_entra_admin_login: ${{ vars.ENTRA_ADMIN_LOGIN }}
+          TF_VAR_client_ip: ${{ steps.ip.outputs.addr }}
+        run: terraform -chdir=infra destroy -input=false -auto-approve

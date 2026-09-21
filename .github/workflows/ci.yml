@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+
+jobs:
+  powershell:
+    name: Analyze, test and check the plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tooling
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -MinimumVersion 1.22.0 -Force
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module PSScriptAnalyzer -ErrorAction Stop
+
+          # A crashed or unloadable analyzer reports zero findings, which reads
+          # exactly like a clean scan. Assert it loaded before believing it.
+          if (-not (Get-Command Invoke-ScriptAnalyzer -ErrorAction SilentlyContinue)) {
+            throw 'PSScriptAnalyzer did not load. A scan that cannot run must fail, not pass quietly.'
+          }
+
+          $results = @()
+          foreach ($tree in 'module', 'scripts') {
+            $results += Invoke-ScriptAnalyzer -Path $tree -Recurse -ErrorAction Stop
+          }
+          $results += Invoke-ScriptAnalyzer -Path tests -Recurse -ErrorAction Stop `
+            -ExcludeRule PSReviewUnusedParameter, PSUseShouldProcessForStateChangingFunctions
+
+          if ($results.Count) {
+            $results | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message |
+              Out-String -Width 200 | Write-Host
+            throw "PSScriptAnalyzer reported $($results.Count) issue(s)."
+          }
+          Write-Host 'PSScriptAnalyzer is clean.'
+
+      # Every judgement about whether a recovery met its objectives is testable
+      # without a database. If these ever need Azure to run, that separation is
+      # gone and the measurements stop being reviewable.
+      - name: Test
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'testResults.xml'
+          Invoke-Pester -Configuration $config
+
+      # The plan is checked by the same code that grades the drill, so a plan
+      # nobody could follow fails here rather than at three in the morning.
+      - name: Check the recovery plan is coherent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ./module/Recovery/Recovery.psm1 -Force -ErrorAction Stop
+
+          $plan = [System.IO.File]::ReadAllText('recovery-plan.json') | ConvertFrom-Json
+
+          foreach ($field in 'RtoSeconds', 'RpoSeconds', 'rtoWhy', 'rpoWhy') {
+            if (-not $plan.objectives.$field) { throw "The plan's objectives are missing '$field'." }
+          }
+          if ($plan.objectives.RtoSeconds -le 0) { throw 'An RTO of zero or less is not an objective, it is a wish.' }
+
+          $order = Get-RecoveryOrder -Service $plan.services
+          if (-not $order.Valid) { throw "The recovery order is not executable: $($order.Detail)" }
+          Write-Host $order.Detail
+
+          $findings = @(Test-RunbookStep -Step $plan.runbook)
+          $errors = @($findings | Where-Object Severity -eq 'Error')
+          $warnings = @($findings | Where-Object Severity -eq 'Warning')
+
+          foreach ($f in $findings) { Write-Host "  $($f.Severity): $($f.Detail)" }
+          if ($errors.Count) { throw "$($errors.Count) runbook step(s) could not be followed by somebody who did not write them." }
+
+          # A runbook nobody else could execute is the normal failure mode, so
+          # warnings are reported and tolerated; errors are not.
+          Write-Host "Runbook: $(@($plan.runbook).Count) steps, $($errors.Count) error(s), $($warnings.Count) warning(s)."
+
+          @(
+            '### Recovery plan'
+            ''
+            "Objectives: **RTO $($plan.objectives.RtoSeconds)s**, **RPO $($plan.objectives.RpoSeconds)s**"
+            ''
+            $order.Detail
+            ''
+            "Runbook: $(@($plan.runbook).Count) steps, $($warnings.Count) warning(s)."
+          ) | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: test-results
+          path: testResults.xml
+          if-no-files-found: warn
+
+  terraform:
+    name: Terraform format, validate, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          terraform -chdir=infra init -backend=false -input=false
+          terraform -chdir=infra validate
+
+      - uses: terraform-linters/setup-tflint@v6
+
+      - name: Lint
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+  security:
+    name: Checkov policy scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          config_file: .checkov.yaml
