@@ -208,20 +208,36 @@ while ($null -eq $failoverCompletedAt -and [datetime]::UtcNow -lt $roleDeadline)
 }
 if ($null -eq $failoverCompletedAt) { throw 'The failover group never reported the secondary as primary.' }
 
-# No write failed at all. The outage was shorter than the gap between two
-# writes, so the honest reading is an observed outage of zero rather than a
-# missing measurement -- recorded alongside the rate, because zero observed at
-# one write per second says nothing about a system taking hundreds.
+# No write failed at all. An earlier version substituted the restore time for
+# the failure so there was always a number, which put the failure after the
+# failover command and produced a negative decision interval in the report --
+# a drill flattering itself with an impossible measurement, which is the exact
+# failure this lab exists to catch. The absence is now carried through as an
+# absence.
 $observedOutage = $null -ne $failedAt
 if (-not $observedOutage) {
-    Write-Information '  no write ever failed: the outage was below this drill write rate resolution.'
-    $failedAt = $restoredAt
+    Write-Information '  no write ever failed: the outage was shorter than the gap between two writes.'
 }
 
 Write-Information 'Failover complete. Reading what survived.'
 $token = Get-SqlToken
 $surviving = @(Invoke-Sql -Endpoint $Listener -DatabaseName $Database -Token $token -Query 'SELECT seq FROM dbo.drill_writes ORDER BY seq;' | ForEach-Object { [int]$_.seq })
-$servingServer = (Invoke-Sql -Endpoint $Listener -DatabaseName $Database -Token $token -Query 'SELECT @@SERVERNAME AS s;').s
+
+# Not @@SERVERNAME. On a geo-replicated database it reported the original
+# server after a failover the control plane had already confirmed, so it is
+# either lagging or means something other than which replica is serving -- and
+# a claim resting on an identifier whose meaning is unclear is not a claim.
+#
+# Updateability is unambiguous: a geo-secondary is READ_ONLY, so READ_WRITE
+# means this connection is being served by the primary replica. Combined with
+# the control plane reporting the secondary region as Primary, that is what
+# establishes the listener followed the failover.
+$updateability = (Invoke-Sql -Endpoint $Listener -DatabaseName $Database -Token $token `
+    -Query "SELECT CAST(DATABASEPROPERTYEX(DB_NAME(),'Updateability') AS nvarchar(64)) AS u;").u
+Write-Information "  the listener is serving a $updateability replica"
+if ($updateability -ne 'READ_WRITE') {
+    throw "After failover the listener is serving a $updateability replica. The promotion did not carry the endpoint with it."
+}
 
 # --------------------------------------------------------------- measurement
 $plan = [System.IO.File]::ReadAllText($PlanPath) | ConvertFrom-Json
@@ -234,7 +250,7 @@ $timeline = [pscustomobject]@{
     ServiceRestoredAt   = $restoredAt
 }
 
-$recovery = Measure-RecoveryObjective -Timeline $timeline
+$recovery = Measure-RecoveryObjective -Timeline $timeline -NoOutageObserved:(-not $observedOutage)
 $window = ($restoredAt - $writeStarted).TotalSeconds
 $dataLoss = Measure-DataLoss -Acknowledged $acknowledged.ToArray() -Surviving $surviving -WindowSeconds $window
 $grade = Compare-ObjectiveToMeasurement -Objective $plan.objectives -Recovery $recovery -DataLoss $dataLoss
@@ -275,7 +291,7 @@ $report = [pscustomobject]@{
         succeeded      = $failbackOk
         seconds        = [math]::Round($failbackSeconds, 1)
         finalRole      = $finalRole
-        servedFromDuringDrill = $servingServer
+        listenerUpdateability   = $updateability
     }
 }
 

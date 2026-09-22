@@ -47,8 +47,29 @@ function Measure-RecoveryObjective {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)][object]$Timeline
+        [Parameter(Mandatory)][object]$Timeline,
+        [switch]$NoOutageObserved
     )
+
+    # Nothing ever failed. Reporting that as "zero seconds, measured from the
+    # failure" claims a precision the drill does not have, and substituting the
+    # restore time for a failure that never happened makes the phase breakdown
+    # run backwards. The honest statement is that the outage was shorter than
+    # the interval between two writes, and the caller reports that interval.
+    if ($NoOutageObserved) {
+        $startedAt = Get-OptionalProperty $Timeline 'FailoverStartedAt'
+        $completedAt = Get-OptionalProperty $Timeline 'FailoverCompletedAt'
+        $breakdown = [ordered]@{}
+        if ($null -ne $startedAt -and $null -ne $completedAt) {
+            $breakdown['failover'] = ([datetime]$completedAt - [datetime]$startedAt).TotalSeconds
+        }
+        return [pscustomobject]@{
+            RecoveryTimeSeconds = 0.0
+            MeasuredFrom        = 'no outage observed'
+            Breakdown           = $breakdown
+            Caveat              = 'No write failed during the failover, so no outage was observed. The outage was shorter than the gap between two writes rather than provably zero, and a slower writer would have seen less still.'
+        }
+    }
 
     $failedAt = Get-OptionalProperty $Timeline 'FailedAt'
     $detectedAt = Get-OptionalProperty $Timeline 'DetectedAt'
@@ -222,6 +243,11 @@ function Compare-ObjectiveToMeasurement {
     $rtoMet = $measuredRto -le $statedRto
     $rtoDetail = if (-not $rtoMet) {
         "Recovery took $([math]::Round($measuredRto, 1)) s against an objective of $statedRto s."
+    }
+    elseif ($measuredFrom -eq 'no outage observed') {
+        # A failover nothing noticed is a pass, and saying so without claiming
+        # a measured zero is the only accurate way to report it.
+        "No write failed during the failover, so the outage was below this drill's write interval against an objective of $statedRto s."
     }
     elseif ($measuredFrom -ne 'failure') {
         # Comfortably inside an objective measured from the wrong place is not

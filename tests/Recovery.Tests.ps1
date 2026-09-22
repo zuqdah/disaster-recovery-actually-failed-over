@@ -61,6 +61,28 @@ Describe 'Measure-RecoveryObjective' {
         $r.Caveat | Should -Match 'went unnoticed'
     }
 
+    # The first live drill produced a negative "decision" interval, because a
+    # failure that never happened had its time filled in from the restore. The
+    # absence has to stay an absence.
+    It 'reports an unobserved outage without inventing a failure time' {
+        $r = Measure-RecoveryObjective -NoOutageObserved -Timeline (New-Timeline -FailedAt $null -DetectedAt $null)
+        $r.RecoveryTimeSeconds | Should -Be 0
+        $r.MeasuredFrom | Should -Be 'no outage observed'
+        $r.Caveat | Should -Match 'shorter than the gap between two writes'
+    }
+
+    It 'never produces a negative interval when no outage was observed' {
+        $r = Measure-RecoveryObjective -NoOutageObserved -Timeline (New-Timeline)
+        foreach ($k in $r.Breakdown.Keys) {
+            $r.Breakdown[$k] | Should -BeGreaterOrEqual 0 -Because "the '$k' phase cannot take negative time"
+        }
+    }
+
+    It 'still reports how long the failover itself took' {
+        $r = Measure-RecoveryObjective -NoOutageObserved -Timeline (New-Timeline -StartedAt 70 -CompletedAt 100)
+        $r.Breakdown['failover'] | Should -Be 30
+    }
+
     It 'refuses a timeline with no recovery in it' {
         { Measure-RecoveryObjective -Timeline (New-Timeline -RestoredAt $null) } |
             Should -Throw -ExpectedMessage '*no ServiceRestoredAt*'
@@ -150,6 +172,14 @@ Describe 'Compare-ObjectiveToMeasurement' {
         $recovery.RecoveryTimeSeconds | Should -BeLessThan 300
         $r.RtoMet | Should -BeFalse
         $r.RtoDetail | Should -Match 'not valid'
+    }
+
+    It 'passes a failover nobody noticed, without claiming a measured zero' {
+        $recovery = Measure-RecoveryObjective -NoOutageObserved -Timeline (New-Timeline -FailedAt $null -DetectedAt $null)
+        $r = Compare-ObjectiveToMeasurement -Objective $script:Objective -Recovery $recovery -DataLoss $script:CleanLoss
+        $r.RtoMet | Should -BeTrue
+        $r.RtoDetail | Should -Match 'below this drill'
+        $r.RtoDetail | Should -Not -Match 'measured from the failure'
     }
 
     It 'fails an inconclusive data loss result rather than passing it' {
