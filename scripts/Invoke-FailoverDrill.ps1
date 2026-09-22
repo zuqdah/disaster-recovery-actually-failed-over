@@ -155,6 +155,10 @@ $failedAt = $null
 $restoredAt = $null
 $failoverCompletedAt = $null
 $outageDeadline = [datetime]::UtcNow.AddMinutes(10)
+# Every phase timed by polling the control plane is only accurate to this
+# interval, so it travels into the report rather than being left for the
+# reader to assume it was exact.
+$rolePollSeconds = 5
 $nextRoleCheck = [datetime]::UtcNow
 
 while ([datetime]::UtcNow -lt $outageDeadline) {
@@ -165,7 +169,7 @@ while ([datetime]::UtcNow -lt $outageDeadline) {
         if ((Get-ReplicationRole -GroupName $FailoverGroup -ResourceGroup $SecondaryResourceGroup -Server $SecondaryServer) -eq 'Primary') {
             $failoverCompletedAt = [datetime]::UtcNow
         }
-        $nextRoleCheck = [datetime]::UtcNow.AddSeconds(5)
+        $nextRoleCheck = [datetime]::UtcNow.AddSeconds($rolePollSeconds)
     }
 
     $seq++
@@ -269,8 +273,20 @@ $failbackOutput = az sql failover-group set-primary --name $FailoverGroup `
 $failbackOk = $LASTEXITCODE -eq 0
 if (-not $failbackOk) { Write-Information "  failback error: $failbackOutput" }
 
-$finalRole = Get-ReplicationRole -GroupName $FailoverGroup -ResourceGroup $PrimaryResourceGroup -Server $PrimaryServer
+# How long the command took is not how long the failback took. The command
+# returned in under two seconds against seven for the forward failover, which
+# says more about when the CLI stops waiting than about the estate. The role
+# flipping back is the thing worth timing, so it is polled the same way the
+# failover was and the two numbers are comparable.
+$finalRole = $null
+$failbackDeadline = [datetime]::UtcNow.AddMinutes(5)
+while ([datetime]::UtcNow -lt $failbackDeadline) {
+    $finalRole = Get-ReplicationRole -GroupName $FailoverGroup -ResourceGroup $PrimaryResourceGroup -Server $PrimaryServer
+    if ($finalRole -eq 'Primary') { break }
+    Start-Sleep -Seconds $rolePollSeconds
+}
 $failbackSeconds = ([datetime]::UtcNow - $failbackStartedAt).TotalSeconds
+$failbackOk = $failbackOk -and $finalRole -eq 'Primary'
 
 # ------------------------------------------------------------------- report
 $report = [pscustomobject]@{
@@ -284,6 +300,7 @@ $report = [pscustomobject]@{
         serviceRestoredAt   = $restoredAt.ToString('o')
     }
     observedOutage = $observedOutage
+    rolePollSeconds = $rolePollSeconds
     recovery  = $recovery
     dataLoss  = $dataLoss
     grade     = $grade
