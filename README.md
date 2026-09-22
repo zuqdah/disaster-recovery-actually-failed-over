@@ -123,16 +123,79 @@ capabilities API reports a region as `Visible` when it is listed but will refuse
 to provision into it, which fails at apply time with `ProvisioningDisabled`
 rather than at plan time.
 
+## What five live runs found
+
+The drill took five attempts against real infrastructure, and the failures are
+the useful part.
+
+**`az sql failover-group set-primary` has no `--no-wait`.** The first run was
+rejected for an unrecognised argument — and the script had piped the command's
+output to `Out-Null`, so it reported only *"the failover command was rejected"*,
+the least useful true thing it could have said. The deeper problem was design:
+that command blocks until failover completes, so nothing would have been writing
+during the switch and the outage would have happened with nobody watching. It now
+goes through ARM, which returns `202 Accepted` immediately.
+
+**The drill reported a decision phase of minus 7.2 seconds.** No write had
+failed, and rather than carry that absence through, the script filled the
+missing failure time in from the restore time so there would always be a number
+— which placed the failure *after* the failover command and made the subtraction
+run backwards. A drill reporting a negative interval is the self-flattery this
+lab exists to catch. The absence is now an absence, graded as *no outage
+observed* rather than a measured zero.
+
+**The biggest one: the control plane reports the failover complete before the
+data plane agrees.** ARM reported the secondary as `Primary`, a write succeeded,
+and the drill called that the moment service returned. It wasn't: that write went
+to the **old** primary, which had not yet been demoted — so it is precisely the
+write most likely to be lost. The recovery was being timed against the wrong
+replica, and the data loss comparison then read its surviving rows from that same
+wrong replica.
+
+This surfaced only because an earlier run had added a `Updateability` check to
+resolve a *different* uncertainty — `@@SERVERNAME` was returning the original
+server after a confirmed failover, and rather than guess what that meant, the
+check was replaced with one whose meaning is unambiguous: a geo-secondary is
+`READ_ONLY`, so `READ_WRITE` establishes that the promoted replica is answering.
+A check added for one reason caught something else entirely.
+
+The outage now ends only when the control plane has swapped **and** the
+connection is served read-write. An earlier run that passed did so by timing
+luck, not by being right.
+
 ## Status
 
 | | |
 |---|---|
-| Unit tests | 32, green, no database required |
+| Unit tests | 36, green, no database required |
 | PSScriptAnalyzer, `terraform validate`, `tflint`, `checkov`, `actionlint` | clean |
-| Live drill | not yet run |
+| Live drill | **passed**, `westus2 -> westcentralus` |
+| Teardown | **verified**: 0 resource groups, 0 SQL servers |
 
-This section will say so plainly until a drill has run end to end against real
-infrastructure.
+From the passing run:
+
+```
+601 writes acknowledged before the failover was commanded
+no write ever failed: the outage was shorter than the gap between two writes
+the listener is serving a READ_WRITE replica
+
+recovery time   0.0 s, measured from no outage observed
+  failover      7.3 s
+recovery point  NoLossObserved at 12.21 writes/second over 52.9 s
+failback        1.8 s, the original region is Primary again
+```
+
+**On those two numbers.** The 7.3 s failover is measured by polling the control
+plane every 5 seconds, so the true figure is somewhere between 2.3 s and 7.3 s;
+the poll interval is recorded in the report rather than left for a reader to
+assume it was exact. The 1.8 s failback is not directly comparable — it uses the
+blocking command, so it is measured precisely. Nothing is being timed on the way
+back, which is why the simpler call is the right one there.
+
+**And on the headline result.** *No outage observed* is not the same as *no
+outage*. At 12 writes per second the gap between two writes is about 80
+milliseconds, so this establishes the outage was shorter than that, at that rate.
+A system taking hundreds of writes a second would have seen more.
 
 ## What this does not do
 
