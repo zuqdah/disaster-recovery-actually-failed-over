@@ -177,13 +177,25 @@ while ([datetime]::UtcNow -lt $outageDeadline) {
         Invoke-Sql -Endpoint $Listener -DatabaseName $Database -Token $token -Query "INSERT INTO dbo.drill_writes (seq) VALUES ($seq);" -TimeoutSeconds 10
         $acknowledged.Add($seq)
 
-        # Done once a write has succeeded and the swap is real. Waiting for a
-        # failed write would hang forever on a failover clean enough not to
-        # produce one, which is the best possible outcome and must not be
-        # mistaken for the drill never recovering.
-        if ($null -ne $failedAt -or $null -ne $failoverCompletedAt) {
-            $restoredAt = [datetime]::UtcNow
-            break
+        # A write succeeding is not the same as the recovery being done, and
+        # this is the trap the drill fell into on its way here. The control
+        # plane reports the swap several seconds before the data plane agrees,
+        # and a write landing in that window goes to the old primary -- which
+        # is about to be demoted, so it is precisely the write most likely to
+        # be lost. Treating it as the moment service returned would time the
+        # recovery against the wrong replica and then measure data loss by
+        # reading from it.
+        #
+        # So the outage ends only when the control plane has swapped AND this
+        # connection is being served read-write, which together mean the
+        # promoted replica is the one answering.
+        if ($null -ne $failoverCompletedAt) {
+            $serving = (Invoke-Sql -Endpoint $Listener -DatabaseName $Database -Token $token `
+                -Query "SELECT CAST(DATABASEPROPERTYEX(DB_NAME(),'Updateability') AS nvarchar(64)) AS u;" -TimeoutSeconds 10).u
+            if ($serving -eq 'READ_WRITE') {
+                $restoredAt = [datetime]::UtcNow
+                break
+            }
         }
     }
     catch {
